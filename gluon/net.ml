@@ -3,34 +3,48 @@ open Gluon_sys
 
 module Addr = struct
   type 't raw_addr = string
-  type tcp_addr = [ `v4 | `v6 ] raw_addr
-  type stream_addr = [ `Tcp of tcp_addr * int ]
+  type ip_addr = [ `v4 | `v6 ] raw_addr
+  type stream_addr = [ `Tcp of ip_addr * int ]
+  type udp_addr = [ `Udp of ip_addr * int ]
+  type inet_addr = [ udp_addr | stream_addr ]
 
   module Ipaddr = struct
-    let to_unix : tcp_addr -> Unix.inet_addr = Unix.inet_addr_of_string
-    let of_unix : Unix.inet_addr -> tcp_addr = Unix.string_of_inet_addr
+    let to_unix : ip_addr -> Unix.inet_addr = Unix.inet_addr_of_string
+    let of_unix : Unix.inet_addr -> ip_addr = Unix.string_of_inet_addr
   end
 
-  let loopback : tcp_addr = "0.0.0.0"
+  let loopback : ip_addr = "0.0.0.0"
 
   let tcp host port =
     assert (String.length host > 0);
     `Tcp (host, port)
 
+  let udp host port =
+    assert (String.length host > 0);
+    `Udp (host, port)
+
   let to_unix addr =
     match addr with
     | `Tcp (host, port) ->
-        (Unix.SOCK_STREAM, Unix.ADDR_INET (Ipaddr.to_unix host, port))
+      (Unix.SOCK_STREAM, Unix.ADDR_INET (Ipaddr.to_unix host, port))
+    | `Udp (host, port) ->
+      (Unix.SOCK_DGRAM, Unix.ADDR_INET (Ipaddr.to_unix host, port))
 
-  let to_domain addr = match addr with `Tcp (_host, _) -> Unix.PF_INET
+  let to_domain addr = match addr with `Tcp (_host, _) | `Udp (_host, _) -> Unix.PF_INET
 
-  let of_unix sockaddr =
+  let tcp_of_unix sockaddr =
     match sockaddr with
     | Unix.ADDR_INET (host, port) -> tcp (Ipaddr.of_unix host) port
     | Unix.ADDR_UNIX addr -> failwith ("unsupported unix addresses: " ^ addr)
 
-  let pp ppf (addr : stream_addr) =
-    match addr with `Tcp (host, port) -> Format.fprintf ppf "%s:%d" host port
+  let udp_of_unix sockaddr =
+    match sockaddr with
+    | Unix.ADDR_INET (host, port) -> udp (Ipaddr.of_unix host) port
+    | Unix.ADDR_UNIX addr -> failwith ("unsupported unix addresses: " ^ addr)
+
+  let pp ppf addr =
+    match addr with
+    | `Tcp (host, port) | `Udp (host, port) -> Format.fprintf ppf "%s:%d" host port
 
   let to_string t = t
 
@@ -39,8 +53,9 @@ module Addr = struct
     | ( (Unix.PF_INET | Unix.PF_INET6),
         (Unix.SOCK_DGRAM | Unix.SOCK_STREAM),
         Unix.ADDR_INET (addr, port) ) -> (
-        match ai_protocol with
-        | 6 -> Some (tcp (Unix.string_of_inet_addr addr) port)
+        match ai_socktype, ai_protocol with
+        | Unix.SOCK_STREAM, 6 -> Some (tcp (Unix.string_of_inet_addr addr) port)
+        | Unix.SOCK_DGRAM, 6 -> Some (udp (Unix.string_of_inet_addr addr) port)
         | _ -> None)
     | _ -> None
 
@@ -62,15 +77,16 @@ module Addr = struct
     | Error err -> Error err
 
   let parse str = Uri.of_string str |> of_uri
-  let get_info (`Tcp (host, port)) = get_info host (Int.to_string port)
-  let ip (`Tcp (ip, _)) = ip
-  let port (`Tcp (_, port)) = port
+  let get_info (`Tcp (host, port) | `Udp (host, port)) = get_info host (Int.to_string port)
+  let ip (`Tcp (ip, _) | `Udp (ip, _)) = ip
+  let port (`Tcp (_, port) | `Udp (_, port)) = port
 end
 
 module Socket = struct
   type 'kind socket = Fd.t
   type listen_socket = [ `listen ] socket
   type stream_socket = [ `stream ] socket
+  type dgram_socket = [ `dgram ] socket
 
   let pp fmt t = Fd.pp fmt t
   let close t = Unix.close t
@@ -102,7 +118,7 @@ module Tcp_listener = struct
     syscall @@ fun () ->
     let raw_fd, client_addr = Unix.accept ~cloexec:true fd in
     Unix.set_nonblock raw_fd;
-    let addr = Addr.of_unix client_addr in
+    let addr = Addr.tcp_of_unix client_addr in
     let fd = Fd.make raw_fd in
     Ok (fd, addr)
 
@@ -176,4 +192,55 @@ module Tcp_stream = struct
       let deregister t selector = Sys.Selector.deregister selector ~fd:t
     end in
     Source.make (module Src) t
+end
+
+module Udp_listener = struct
+  type t = Socket.dgram_socket
+
+  let pp = Socket.pp
+  let close = Socket.close
+
+  let bind ?(reuse_addr = true) ?(reuse_port = true) addr =
+    syscall @@ fun () ->
+    let sock_domain = Addr.to_domain addr in
+    let sock_type, sock_addr = Addr.to_unix addr in
+    let fd = Socket.make sock_domain sock_type in
+    Unix.setsockopt fd Unix.SO_REUSEADDR reuse_addr;
+    Unix.setsockopt fd Unix.SO_REUSEPORT reuse_port;
+    Unix.bind fd sock_addr;
+    Ok fd
+
+  let to_source t =
+    let module Src = struct
+      type nonrec t = t
+
+      let register t selector token interest =
+        Sys.Selector.register selector ~fd:t ~token ~interest
+
+      let reregister t selector token interest =
+        Sys.Selector.reregister selector ~fd:t ~token ~interest
+
+      let deregister t selector = Sys.Selector.deregister selector ~fd:t
+    end in
+    Source.make (module Src) t
+end
+
+module Udp_datagram = struct
+  type t = Socket.dgram_socket
+
+  let pp = Socket.pp
+  let close = Socket.close
+
+  let recv socket ?(pos = 0) ?len buf =
+    let len = Option.value len ~default:(Bytes.length buf - 1) in
+    syscall @@ fun () ->
+    let count, addr = Unix.recvfrom socket buf pos len [] in
+    let addr = Addr.udp_of_unix addr in
+    Ok (count, addr)
+
+  let send socket ?(pos = 0) ?len buf addr =
+    let len = Option.value len ~default:(Bytes.length buf) in
+    let _socket_type, addr = Addr.to_unix addr in
+    syscall @@ fun () ->
+    Ok (Unix.sendto socket buf pos len [] addr)
 end

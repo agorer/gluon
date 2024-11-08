@@ -146,28 +146,33 @@ end
 module Net : sig
   module Addr : sig
     type 't raw_addr = string
-    type tcp_addr = [ `v4 | `v6 ] raw_addr
-    type stream_addr
+    type ip_addr = [ `v4 | `v6 ] raw_addr
+    type stream_addr = [ `Tcp of ip_addr * int ]
+    type udp_addr = [ `Udp of ip_addr * int ]
+    type inet_addr = [udp_addr | stream_addr]
 
-    val get_info : stream_addr -> (stream_addr list, [> `Noop ]) io_result
-    val ip : stream_addr -> string
-    val loopback : tcp_addr
-    val of_addr_info : Unix.addr_info -> stream_addr option
-    val of_unix : Unix.sockaddr -> stream_addr
-    val of_uri : Uri.t -> (stream_addr, [> `Noop ]) io_result
-    val parse : string -> (stream_addr, [> `Noop ]) io_result
-    val port : stream_addr -> int
-    val pp : Format.formatter -> stream_addr -> unit
-    val tcp : tcp_addr -> int -> stream_addr
-    val to_domain : stream_addr -> Unix.socket_domain
-    val to_string : tcp_addr -> string
-    val to_unix : stream_addr -> Unix.socket_type * Unix.sockaddr
+    val get_info : inet_addr -> (inet_addr list, [> `Noop ]) io_result
+    val ip : inet_addr -> string
+    val loopback : ip_addr
+    val of_addr_info : Unix.addr_info -> inet_addr option
+    val tcp_of_unix : Unix.sockaddr -> stream_addr
+    val udp_of_unix : Unix.sockaddr -> udp_addr
+    val of_uri : Uri.t -> (inet_addr, [> `Noop ]) io_result
+    val parse : string -> (inet_addr, [> `Noop ]) io_result
+    val port : inet_addr -> int
+    val pp : Format.formatter -> inet_addr -> unit
+    val tcp : ip_addr -> int -> stream_addr
+    val udp : ip_addr -> int -> udp_addr
+    val to_domain : inet_addr -> Unix.socket_domain
+    val to_string : ip_addr -> string
+    val to_unix : inet_addr -> Unix.socket_type * Unix.sockaddr
   end
 
   module Socket : sig
     type 'kind socket = Fd.t
     type listen_socket = [ `listen ] socket
     type stream_socket = [ `stream ] socket
+    type dgram_socket = [ `dgram ] socket
 
     val pp : Format.formatter -> _ socket -> unit
     val close : _ socket -> unit
@@ -211,6 +216,33 @@ module Net : sig
     val close : t -> unit
     val pp : Format.formatter -> t -> unit
     val to_source : t -> Source.t
+  end
+
+  module Udp_listener : sig
+    type t = Socket.dgram_socket
+
+    val bind :
+      ?reuse_addr:bool ->
+      ?reuse_port:bool ->
+      Addr.udp_addr ->
+      (t, [> `Noop ]) io_result
+
+    val close : t -> unit
+    val pp : Format.formatter -> t -> unit
+    val to_source : t -> Source.t
+  end
+
+  module Udp_datagram : sig
+    type t = Socket.dgram_socket
+
+    val recv : t -> ?pos:int -> ?len:int -> bytes
+      -> (int * Addr.udp_addr, [> `Noop ]) io_result
+
+    val send : t -> ?pos:int -> ?len:int -> bytes -> Addr.udp_addr
+      -> (int, [> `Noop ]) io_result
+
+    val close : t -> unit
+    val pp : Format.formatter -> t -> unit
   end
 end
 

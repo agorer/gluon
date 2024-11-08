@@ -38,9 +38,9 @@ let run () =
   let accept () =
     let do_accept () =
       log "accepting connection\n%!";
-      let* conn, addr = Net.Tcp_listener.accept server in
+      let* conn, _addr = Net.Tcp_listener.accept server in
       let token = Token.make (Atomic.fetch_and_add conn_id 1) in
-      log "accepted %a with %a\n%!" Net.Addr.pp addr Token.pp token;
+      log "accepted %a with %a\n%!" Net.Addr.pp (addr :> Net.Addr.inet_addr) Token.pp token;
       let* () =
         Poll.register poll token
           Interest.(add readable writable)
